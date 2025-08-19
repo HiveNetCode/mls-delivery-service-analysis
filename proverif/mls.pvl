@@ -1,0 +1,1160 @@
+(* Modelling of MLS protocol (RFC 9420) *)
+
+(* -------------------------------------------------------------------------- *)
+(* Cryptographic schemes *)
+
+(* HPKE *)
+type HPKEPrivKey.
+type HPKEPubKey.
+fun HPKEDeriveKey(bitstring): HPKEPrivKey.
+fun HPKEGetPublic(HPKEPrivKey): HPKEPubKey.
+fun HPKEEncrypt(HPKEPubKey, bitstring, bitstring): bitstring.
+fun HPKEDecrypt(HPKEPrivKey, bitstring, bitstring): bitstring reduc
+    forall key:HPKEPrivKey, ctx:bitstring, pt:bitstring;
+        HPKEDecrypt(key, ctx, HPKEEncrypt(HPKEGetPublic(key), ctx, pt)) = pt.
+
+(* Signature *)
+type SignaturePrivKey.
+type SignaturePubKey.
+fun SignatureGetPublic(SignaturePrivKey): SignaturePubKey.
+fun SignatureSign(SignaturePrivKey, SignaturePubKey, bitstring): bitstring.
+fun SignatureGetMessage(bitstring): bitstring reduc
+    forall key:SignaturePrivKey, msg:bitstring;
+        SignatureGetMessage(SignatureSign(key, SignatureGetPublic(key), msg)) = msg.
+fun SignatureVerify(SignaturePubKey, bitstring, bitstring):bool reduc
+    forall key:SignaturePrivKey, msg:bitstring;
+        SignatureVerify(SignatureGetPublic(key),
+            msg, SignatureSign(key, SignatureGetPublic(key), msg)
+        ) = true
+    otherwise forall key:SignaturePubKey, msg:bitstring, signature:bitstring;
+        SignatureVerify(key, msg, signature) = false.
+
+(* MAC *)
+fun MAC(bitstring, bitstring): bitstring.
+(* fun VerifyMAC(bitstring, bitstring, bitstring):bool reduc
+    forall key:bitstring, msg:bitstring;
+        VerifyMAC(key, msg, MAC(key, msg)) = true
+    otherwise forall key:bitstring, msg:bitstring, mac:bitstring;
+        VerifyMAC(key, msg, mac) = false. *)
+
+letfun VerifyMAC(key:bitstring, msg:bitstring, mac:bitstring) =
+    MAC(key, msg) = mac.
+
+(* Lengths for KDF outputs *)
+type length. (* TODO may not be the right modelization *)
+const KDFNh:length.
+const AEADNk,AEADNn:length.
+
+(* KDF *)
+fun KDFExtract(bitstring, bitstring): bitstring.
+fun KDFExpand(bitstring, bitstring, length): bitstring.
+
+(* Hash *)
+fun Hash(bitstring): bitstring.
+
+(* Bitwise operations *)
+fun nonce_xor(bitstring, bitstring): bitstring. (* TODO think about if we need to add property to extract one operand or else *)
+
+
+(* -------------------------------------------------------------------------- *)
+(* MLS Label-based cryptographic operations (See Sect. 5) *)
+
+(* Bitstring concatenation *)
+fun pair(bitstring, bitstring): bitstring [data].
+fun triple(bitstring, bitstring, bitstring): bitstring [data].
+
+(* Encode integer *)
+fun encodeUInt16(length): bitstring [data, typeConverter].
+
+(* HPKE with Labels *)
+letfun EncryptWithLabel(key:HPKEPubKey, lbl:bitstring, ctx:bitstring, pt:bitstring) =
+    HPKEEncrypt(key, pair(lbl, ctx), pt).
+letfun DecryptWithLabel(key:HPKEPrivKey, lbl:bitstring, ctx:bitstring, ct:bitstring) =
+    HPKEDecrypt(key, pair(lbl, ctx), ct).
+
+(* Signatures with Labels *)
+letfun SignWithLabel(key:SignaturePrivKey, lbl:bitstring, msg:bitstring) =
+    SignatureSign(key, SignatureGetPublic(key), pair(lbl, msg)).
+letfun VerifyWithLabel(key:SignaturePubKey, lbl:bitstring, msg:bitstring, signature:bitstring)
+    = SignatureVerify(key, pair(lbl, msg), signature).
+
+(* KDF with Labels *)
+letfun ExpandWithLabel(inSecret:bitstring, lbl:bitstring, ctx:bitstring, len:length)
+    = KDFExpand(inSecret, triple(encodeUInt16(len), lbl, ctx), len).
+const empty:bitstring.
+letfun DeriveSecret(inSecret:bitstring, lbl:bitstring)
+    = ExpandWithLabel(inSecret, lbl, empty, KDFNh).
+(* TODO Needed or not *)
+fun KDFSample(bitstring): bitstring. (* Takes the first KDFNh bytes to have at most a string of KDFNh bytes *)
+
+
+(* -------------------------------------------------------------------------- *)
+(* Data Structures *)
+
+type LeafIndex.
+
+type LeafNodeSrc.
+const LeafNodeKP,LeafNodeUpdate,LeafNodeCommit:LeafNodeSrc.
+
+type LeafNodeContext.
+fun leafNodeContext(LeafIndex): LeafNodeContext [data].
+fun emptyLeafNodeContext(): LeafNodeContext [data].
+
+letfun verifyLeafNodeContextType(src:LeafNodeSrc, ctx:LeafNodeContext) =
+    if src = LeafNodeKP && ctx = emptyLeafNodeContext() then true
+    else if src = LeafNodeUpdate || src = LeafNodeCommit then
+        let leafNodeContext(b) = ctx
+            in true
+            else false.
+
+type LeafNode.
+fun emptyLeafNode(): LeafNode [data].
+fun leafNode(HPKEPubKey, SignaturePubKey, LeafNodeSrc, bitstring): LeafNode [data].
+
+type LeafNodeTBS.
+fun leafNodeTBS(HPKEPubKey, SignaturePubKey, LeafNodeSrc, LeafNodeContext): LeafNodeTBS [data].
+fun encodeLeafNodeTBS(LeafNodeTBS): bitstring [data, typeConverter].
+
+const leafNodeTBSLbl:bitstring.
+letfun createSignedLeafNode(key:HPKEPubKey, signKey:SignaturePrivKey, src:LeafNodeSrc,
+    ctx:LeafNodeContext) =
+        let tbs = leafNodeTBS(key, SignatureGetPublic(signKey), src, ctx) in
+        let signature = SignWithLabel(signKey, leafNodeTBSLbl, encodeLeafNodeTBS(tbs)) in
+        leafNode(key, SignatureGetPublic(signKey), src, signature).
+
+letfun verifyLeafNodeSignature(lf:LeafNode, src:LeafNodeSrc, ctx:LeafNodeContext) =
+    let leafNode(pubKey, signPubKey, =src, signature) = lf in
+    if verifyLeafNodeContextType(src, ctx) then
+    let tbs = leafNodeTBS(pubKey, signPubKey, src, ctx) in
+    VerifyWithLabel(signPubKey, leafNodeTBSLbl, encodeLeafNodeTBS(tbs), signature).
+
+letfun verifyTreeLeafNode(lf:LeafNode, idx:LeafIndex) =
+    let leafNode(pubKey, signPubKey, src, signature) = lf in
+    let ctx = (
+        if src = LeafNodeKP
+            then emptyLeafNodeContext()
+        else if src = LeafNodeUpdate || src = LeafNodeCommit
+            then leafNodeContext(idx)
+    ) in
+    let tbs = leafNodeTBS(pubKey, signPubKey, src, ctx) in
+    VerifyWithLabel(signPubKey, leafNodeTBSLbl, encodeLeafNodeTBS(tbs), signature).
+
+type KeyPackage.
+fun keyPackage(HPKEPubKey, LeafNode, bitstring): KeyPackage [data].
+
+type KeyPackageTBS.
+fun keyPackageTBS(HPKEPubKey, LeafNode): KeyPackageTBS [data].
+fun encodeKeyPackageTBS(KeyPackageTBS): bitstring [data, typeConverter].
+
+const keyPackageTBSLbl:bitstring.
+letfun createSignedKeyPackage(key:SignaturePrivKey, initKey:HPKEPubKey, leaf:LeafNode) =
+    let tbs = keyPackageTBS(initKey, leaf) in
+    let signature = SignWithLabel(key, keyPackageTBSLbl, encodeKeyPackageTBS(tbs)) in
+    keyPackage(initKey, leaf, signature).
+
+letfun verifyKeyPackage(kp:KeyPackage) =
+    let keyPackage(initKey, lf, kpSignature) = kp in
+    let leafNode(pubKey, signPubKey, src, lfSignature) = lf in
+    if src = LeafNodeKP && initKey <> pubKey then (
+        if verifyLeafNodeSignature(lf, LeafNodeKP, emptyLeafNodeContext()) then (
+            let tbs = keyPackageTBS(initKey, lf) in
+            VerifyWithLabel(signPubKey, keyPackageTBSLbl, encodeKeyPackageTBS(tbs),
+                kpSignature)
+        ) else false
+    ) else false.
+
+type Proposal.
+fun addProposal(KeyPackage): Proposal [data].
+fun updateProposal(LeafNode): Proposal [data].
+fun removeProposal(LeafIndex): Proposal [data].
+
+type ProposalOrRef.
+fun wrapProposal(Proposal): ProposalOrRef [data].
+fun wrapProposalRef(bitstring): ProposalOrRef [data].
+fun noProposalOrRef(): ProposalOrRef [data].
+
+type ProposalOrRefWithIndex.
+fun proposalOrRefWithIndex(LeafIndex, ProposalOrRef): ProposalOrRefWithIndex [data].
+fun noProposalOrRefWithIndex(): ProposalOrRefWithIndex [data].
+
+type SubProposals.
+fun subProposalList(ProposalOrRef): SubProposals [data].
+fun subIndexedProposals(ProposalOrRefWithIndex)
+    : SubProposals [data].
+
+type Proposals.
+fun listProposals(SubProposals, SubProposals, SubProposals): Proposals [data].
+
+type Commit.
+fun createCommit(Proposals, LeafNode, channel): Commit [data].
+
+type GroupSecrets. (* joiner_secret + path_secret *)
+fun groupSecrets(bitstring, bitstring): GroupSecrets [data].
+fun encodeGroupSecrets(GroupSecrets): bitstring [data, typeConverter].
+
+type Welcome. (* welcome_secrets (for each new member) + encrypted Group Info *)
+fun createWelcome(channel, bitstring): Welcome [data].
+
+
+(* -------------------------------------------------------------------------- *)
+(* Message framing (See Sect. 6) *)
+
+type GroupContext. (* epoch, treeHash, confirmedTranscriptHash *)
+fun groupContext(nat, bitstring, bitstring): GroupContext [data].
+fun encodeGroupContext(GroupContext): bitstring [data, typeConverter].
+
+letfun groupContextGetEpoch(ctx:GroupContext) =
+    let groupContext(epoch, _, _) = ctx in epoch.
+
+type ContentType.
+const CT_Proposal,CT_Commit,CT_AppData:ContentType.
+
+type FramedContentContent.
+fun proposalAsContent(Proposal): FramedContentContent [data].
+fun commitAsContent(Commit): FramedContentContent [data].
+fun appDataAsContent(bitstring): FramedContentContent [data].
+
+letfun getContentType(fcc:FramedContentContent) =
+    let proposalAsContent(_) = fcc in CT_Proposal
+    else let commitAsContent(_) = fcc in CT_Commit
+    else let appDataAsContent(_) = fcc in CT_AppData.
+
+(* Note: we consider only member senders, so sender is simplified as LeafIndex *)
+type FramedContent.
+fun framedContent(nat, LeafIndex, bitstring, FramedContentContent):
+    FramedContent [data].
+
+type FramedContentTBS.
+fun framedContentTBS(FramedContent, GroupContext): FramedContentTBS [data].
+fun encodeFramedContentTBS(FramedContentTBS): bitstring [data, typeConverter].
+
+(* confirmation_tag = MAC(confirmation_key, GroupContext.confirmed_transcript_hash) *)
+type CommitConfirmationTag.
+fun emptyConfirmationTag(): CommitConfirmationTag [data]. (* If the message was not a commit *)
+fun confirmationTag(bitstring): CommitConfirmationTag [data].
+
+type FramedContentAuthData.
+fun framedContentAuthData(bitstring, CommitConfirmationTag): FramedContentAuthData [data].
+
+type AuthenticatedContent.
+fun authenticatedContent(FramedContent, FramedContentAuthData): AuthenticatedContent [data].
+fun encodeAuthenticatedContent(AuthenticatedContent): bitstring [data, typeConverter].
+
+letfun authContentGetContent(authContent:AuthenticatedContent) =
+    let authenticatedContent(fc, _) = authContent in fc.
+letfun authContentGetAuthData(authContent:AuthenticatedContent) =
+    let authenticatedContent(_, authFC) = authContent in authFC.
+letfun authContentGetConfirmTag(authContent:AuthenticatedContent) =
+    let authenticatedContent(_, framedContentAuthData(_, confirmationTag(t))) = authContent in t.
+letfun authContentIsEmptyConfirmTag(authContent:AuthenticatedContent) =
+    let authenticatedContent(_, framedContentAuthData(_, emptyConfirmationTag()))
+        = authContent in
+    true.
+letfun authContentGetSender(authContent:AuthenticatedContent) =
+    let authenticatedContent(framedContent(_, sender, _, _), _) = authContent in
+    sender.
+
+const framedContentTBSLbl:bitstring.
+letfun signFramedContent(key:SignaturePrivKey, ctx:GroupContext, sender:LeafIndex,
+    authenticatedData:bitstring, content:FramedContentContent) =
+        let fc = framedContent(groupContextGetEpoch(ctx), sender,
+            authenticatedData, content) in
+        let tbs = framedContentTBS(fc, ctx) in
+        let signature = SignWithLabel(key, framedContentTBSLbl, encodeFramedContentTBS(tbs)) in
+        let authData = framedContentAuthData(signature, emptyConfirmationTag()) in
+        authenticatedContent(fc, authData).
+
+letfun authContentSetConfirmationTag(authContent:AuthenticatedContent,
+    confirmTag:CommitConfirmationTag) =
+        let authenticatedContent(fc, framedContentAuthData(sig, _)) = authContent in
+        authenticatedContent(fc, framedContentAuthData(sig, confirmTag)).
+
+type AuthenticatedContentTBM.
+fun authenticatedContentTBM(FramedContentTBS, FramedContentAuthData): AuthenticatedContentTBM [data].
+fun encodeAuthenticatedContentTBM(AuthenticatedContentTBM): bitstring [data, typeConverter].
+
+type PublicMessage.
+fun publicMessage(FramedContent, FramedContentAuthData, bitstring): PublicMessage [data].
+letfun MACAuthenticatedContent(membershipKey:bitstring, authContent:AuthenticatedContent,
+    ctx:GroupContext) =
+        let content = authContentGetContent(authContent) in
+        let contentAuthData = authContentGetAuthData(authContent) in
+        let tbs = framedContentTBS(content, ctx) in
+        let tbm = authenticatedContentTBM(tbs, contentAuthData) in
+        let membershipTag = MAC(membershipKey, encodeAuthenticatedContentTBM(tbm)) in
+        publicMessage(content, contentAuthData, membershipTag).
+
+type PrivateMessageContent.
+fun privateMessageContent(FramedContentContent, FramedContentAuthData): PrivateMessageContent [data].
+fun encodePrivateMessageContent(PrivateMessageContent): bitstring [data, typeConverter].
+
+type PrivateContentAAD.
+fun createPrivateContentAAD(nat, ContentType, bitstring): PrivateContentAAD [data].
+fun encodePrivateContentAAD(PrivateContentAAD): bitstring [data, typeConverter].
+
+type SenderData.
+fun createSenderData(LeafIndex): SenderData [data].
+fun encodeSenderData(SenderData): bitstring [data, typeConverter].
+
+type SenderDataAAD.
+fun createSenderDataAAD(nat, ContentType): SenderDataAAD [data].
+fun encodeSenderDataAAD(SenderDataAAD): bitstring [data, typeConverter].
+
+type EncryptionInfo.
+fun encryptionInfo(bitstring, bitstring): EncryptionInfo [data].
+
+type PrivateMessage.
+fun privateMessage(nat, ContentType, bitstring, bitstring, bitstring): PrivateMessage [data].
+
+letfun getMsgContentType(pm:PrivateMessage) =
+    let privateMessage(_, ct, _, _, _) = pm in
+    ct.
+
+const keyLbl,nonceLbl:bitstring.
+letfun protectAuthenticatedContent(senderDataSecret:bitstring, encInfo:EncryptionInfo,
+    authContent:AuthenticatedContent) =
+        let fc = authContentGetContent(authContent) in
+        let authData = authContentGetAuthData(authContent) in
+        let framedContent(ep, sender, appAuthData, content) = fc in
+        let contentType = getContentType(content) in
+        (* Encrypt content *)
+        let encryptionInfo(encKey, encNonce) = encInfo in
+        let contentPubKey = HPKEGetPublic(HPKEDeriveKey(encKey)) in
+        let privateContentAAD = createPrivateContentAAD(ep, contentType, appAuthData) in
+        let privateContent = privateMessageContent(content, authData) in
+        let ct = EncryptWithLabel(contentPubKey, encNonce,
+            encodePrivateContentAAD(privateContentAAD),
+            encodePrivateMessageContent(privateContent)) in
+        (* Encrypt sender data *)
+        let ctSample = KDFSample(ct) in
+        let dataPubKey = HPKEGetPublic(HPKEDeriveKey(ExpandWithLabel(
+            senderDataSecret, keyLbl, ctSample, AEADNk))) in
+        let dataNonce = ExpandWithLabel(senderDataSecret, nonceLbl, ctSample, AEADNn) in
+        let senderDataAAD = createSenderDataAAD(ep, contentType) in
+        let senderData = createSenderData(sender) in
+        let encryptedSenderData = EncryptWithLabel(dataPubKey, dataNonce,
+            encodeSenderDataAAD(senderDataAAD), encodeSenderData(senderData)) in
+        privateMessage(ep, contentType, appAuthData, encryptedSenderData, ct).
+
+type TreeID.
+
+type PublicKeyTree.
+fun treeMembers(channel): PublicKeyTree [data].
+
+type GroupInfoTBS.
+fun groupInfoTBS(GroupContext, bitstring, PublicKeyTree, LeafIndex):
+    GroupInfoTBS [data].
+fun encodeGroupInfoTBS(GroupInfoTBS): bitstring [data, typeConverter].
+
+type GroupInfo.
+fun groupInfo(GroupContext, bitstring, PublicKeyTree, LeafIndex, bitstring):
+    GroupInfo [data].
+fun encodeGroupInfo(GroupInfo): bitstring [data, typeConverter].
+
+const groupInfoTBSLbl:bitstring.
+letfun SignGroupInfo(senderKey:SignaturePrivKey, ctx:GroupContext,
+    confirmTag:bitstring, tree:PublicKeyTree, sender:LeafIndex) =
+        let tbs = groupInfoTBS(ctx, confirmTag, tree, sender) in
+        let signature = SignWithLabel(senderKey, groupInfoTBSLbl, encodeGroupInfoTBS(tbs)) in
+        groupInfo(ctx, confirmTag, tree, sender, signature).
+
+type MLSMessage.
+fun wrapPublicMessage(PublicMessage): MLSMessage [data].
+fun wrapPrivateMessage(PrivateMessage): MLSMessage [data].
+fun wrapWelcome(Welcome): MLSMessage [data].
+fun wrapGroupInfo(GroupInfo): MLSMessage [data].
+fun wrapKeyPackage(KeyPackage): MLSMessage [data].
+
+(* For convenience when reusing some macros *)
+const emptyMsg:MLSMessage.
+
+(* Reference to a Proposal, in MLS it will be a hash with a given label *)
+fun ReferenceToProposal(AuthenticatedContent): bitstring [data].
+
+
+(* -------------------------------------------------------------------------- *)
+(* Key schedule *)
+
+const joinerLbl:bitstring.
+letfun deriveJoinerSecret(prevInitSecret:bitstring, commitSecret:bitstring,
+    ctx:GroupContext) =
+        let s = KDFExtract(prevInitSecret, commitSecret) in
+        ExpandWithLabel(s, joinerLbl, encodeGroupContext(ctx), KDFNh).
+
+const welcomeLbl:bitstring.
+letfun deriveWelcomeSecret(joinerSecret:bitstring, psk:bitstring) =
+    let s = KDFExtract(joinerSecret, psk) in
+    DeriveSecret(s, welcomeLbl).
+
+const epochLbl:bitstring.
+letfun deriveEpochSecret(joinerSecret:bitstring, psk:bitstring, ctx:GroupContext) =
+    let s = KDFExtract(joinerSecret, psk) in
+    ExpandWithLabel(s, epochLbl, encodeGroupContext(ctx), KDFNh).
+
+const initLbl,senderDataLbl,encryptionLbl,confirmLbl:bitstring.
+letfun keyScheduleDeriveSecret(epochSecret:bitstring, secretLbl:bitstring) =
+    DeriveSecret(epochSecret, secretLbl).
+
+(* Emulate secret tree (key ratcheting mechanisms for exchanged messages) *)
+(* /!\ Not forward secure as we always iterate from root secret /!\ *)
+fun secretTreeKey(bitstring, LeafIndex, bitstring): bitstring.
+fun secretTreeNonce(bitstring, LeafIndex, bitstring): bitstring.
+
+const handshakeLbl,applicationLbl:bitstring.
+letfun secretTreeGetEncryptionInfo(encryptionSecret:bitstring, sender:LeafIndex,
+    typeLbl:bitstring) =
+        let key = secretTreeKey(encryptionSecret, sender, typeLbl) in
+        let nonce = secretTreeNonce(encryptionSecret, sender, typeLbl) in
+        encryptionInfo(key, nonce).
+
+letfun contentTypeToEncLbl(ct:ContentType) =
+    if ct = CT_Proposal || ct = CT_Commit then handshakeLbl
+    else if ct = CT_AppData then applicationLbl.
+
+
+(* -------------------------------------------------------------------------- *)
+(* Session/state management *)
+(* Inspired from MLS++ (https://github.com/cisco/mlspp/blob/main/include/mls/state.h) *)
+
+type MLSState.
+fun mlsState(GroupContext, TreeID, HPKEPrivKey, bitstring, LeafIndex,
+    SignaturePrivKey): MLSState [data].
+
+letfun getInitSecret(epochSecret:bitstring) =
+    keyScheduleDeriveSecret(epochSecret, initLbl).
+letfun getSenderSecret(epochSecret:bitstring) =
+    keyScheduleDeriveSecret(epochSecret, senderDataLbl).
+letfun getEncryptionSecret(epochSecret:bitstring) =
+    keyScheduleDeriveSecret(epochSecret, encryptionLbl).
+letfun getConfirmationKey(epochSecret:bitstring) =
+    keyScheduleDeriveSecret(epochSecret, confirmLbl).
+
+fun transcriptionHashInput(FramedContent, bitstring): bitstring.
+
+letfun computeTranscriptHashInput(commit:AuthenticatedContent) =
+    let authenticatedContent(fc, authData) = commit in
+    let framedContentAuthData(signatureFc, _) = authData in
+    transcriptionHashInput(fc, signatureFc).
+
+letfun computeConfirmTagWithKey(ctx:GroupContext, confirmKey:bitstring) =
+    let groupContext(_, _, transcriptHash) = ctx in
+    MAC(confirmKey, transcriptHash).
+
+letfun computeConfirmationTag(ctx:GroupContext, epochSecret:bitstring) =
+    computeConfirmTagWithKey(ctx, getConfirmationKey(epochSecret)).
+
+letfun decodePrivateMessage(state:MLSState, msg:PrivateMessage) =
+    let mlsState(ctx, _, _, epochSecret, _, _) = state in
+
+    let ep = groupContextGetEpoch(ctx) in
+    let privateMessage(mEp, contentType, appAuthData, encSenderData, ct) = msg in
+    if mEp = ep then
+    (* Decrypt sender data *)
+    let senderSecret = getSenderSecret(epochSecret) in
+    let ctSample = KDFSample(ct) in
+    let senderDataNonce = ExpandWithLabel(senderSecret, nonceLbl, ctSample, AEADNn) in
+    let senderDataKey = HPKEDeriveKey(ExpandWithLabel(senderSecret, keyLbl, ctSample, AEADNk)) in
+    let senderDataAAD = createSenderDataAAD(ep, contentType) in
+    let senderData = DecryptWithLabel(senderDataKey, senderDataNonce,
+        encodeSenderDataAAD(senderDataAAD), encSenderData) in
+    let encodeSenderData(createSenderData(sender)) = senderData in
+    (* Decrypt content *)
+    let encSecret = getEncryptionSecret(epochSecret) in
+    let encInfo = secretTreeGetEncryptionInfo(encSecret, sender,
+        contentTypeToEncLbl(contentType)) in
+    let encryptionInfo(encKey, encNonce) = encInfo in
+    let contentAAD = createPrivateContentAAD(ep, contentType, appAuthData) in
+    let messageContent = DecryptWithLabel(HPKEDeriveKey(encKey), encNonce,
+        encodePrivateContentAAD(contentAAD), ct) in
+    (* Extract content as AuthenticatedContent *)
+    let encodePrivateMessageContent(privateMessageContent(content, authData))
+        = messageContent in
+    authenticatedContent(framedContent(ep, sender, appAuthData, content), authData).
+
+
+(* -------------------------------------------------------------------------- *)
+(* Public & Private Tree *)
+
+table groupMembership(TreeID, LeafIndex, LeafNode).
+
+letfun getLeafNode(tid:TreeID, idx:LeafIndex) =
+    get groupMembership(=tid, =idx, lf) in lf.
+
+(* TODO How to do tree hash with new group structure *)
+(* fun computeTreeHash(TreeNode): bitstring. *)
+
+letfun findLeaf(tid:TreeID, encPub:HPKEPubKey, sigPub:SignaturePubKey) =
+    get groupMembership(=tid, idx, leafNode(=encPub, =sigPub, _, _)) in idx.
+
+event addedLeaf(TreeID, LeafIndex, LeafNode).
+(* Local uniqueness of leaf index (local to ~epoch, does not prevent implicit remove) *)
+restriction tid:TreeID, idx:LeafIndex, lf:LeafNode, lf':LeafNode;
+    event(addedLeaf(tid, idx, lf)) && event(addedLeaf(tid, idx, lf')) ==> lf = lf'.
+
+let ApplyAdd(addDst:TreeID, addIdx:LeafIndex, newLf:LeafNode) =
+    event addedLeaf(addDst, addIdx, newLf);
+    insert groupMembership(addDst, addIdx, newLf).
+
+let ApplyUpdate(updSrc:TreeID, updIdx:LeafIndex, updLf:LeafNode, updDst:TreeID) =
+    insert groupMembership(updDst, updIdx, updLf);
+    !(
+        get groupMembership(=updSrc, =updIdx, _) in (* Ensure Update is not only an Add *)
+        get groupMembership(=updSrc, idx, lf) in
+        if idx <> updIdx then
+            insert groupMembership(updDst, idx, lf)
+    ).
+
+let ApplyRemove(remSrc:TreeID, remIdx:LeafIndex, remDst:TreeID) =
+    !(
+        get groupMembership(=remSrc, =remIdx, _) in (* Ensure Remove is not NO-OP *)
+        get groupMembership(=remSrc, idx, lf) in
+        if idx <> remIdx then
+            insert groupMembership(remDst, idx, lf)
+    ).
+
+letfun getPublicKey(tid:TreeID, idx:LeafIndex) =
+    let leaf = getLeafNode(tid, idx) in
+    let leafNode(_, signPubKey, _, _) = leaf in
+    signPubKey.
+
+letfun getEncPublicKey(tid:TreeID, idx:LeafIndex) =
+    let leaf = getLeafNode(tid, idx) in
+    let leafNode(pub, _, _, _) = leaf in
+    pub.
+
+letfun verifyLeafTreeNode(lf:LeafNode, idx:LeafIndex) =
+    let emptyLeafNode() = lf
+        in true
+    else verifyTreeLeafNode(lf, idx).
+
+
+(* -------------------------------------------------------------------------- *)
+(* Handling and creating messages *)
+
+letfun verifyAuthMessage(tid:TreeID, ctx:GroupContext,
+    authContent:AuthenticatedContent) =
+    let groupContext(ep, _, _) = ctx in
+    let authenticatedContent(fc, authData) = authContent in
+    let framedContent(mEp, sender, appAuthData, content) = fc in
+    if appAuthData = empty then (* Not used for now *)
+    (* Verify metadata *)
+    if mEp <> ep
+    then
+        false
+    else
+        let framedContentAuthData(signature, _) = authData in
+        let pubKey = getPublicKey(tid, sender) in
+        let tbs = framedContentTBS(fc, ctx) in
+        VerifyWithLabel(pubKey, framedContentTBSLbl, encodeFramedContentTBS(tbs), signature).
+
+letfun verifyAuthenticatedContent(state:MLSState, authContent:AuthenticatedContent) =
+    let mlsState(ctx, pub, _, _, _, _) = state in
+    verifyAuthMessage(pub, ctx, authContent).
+
+letfun verifyAuthContentWithKey(pubKey:SignaturePubKey, ctx:GroupContext,
+    authContent:AuthenticatedContent) =
+    let groupContext(ep, _, _) = ctx in
+    let authenticatedContent(fc, authData) = authContent in
+    let framedContent(mEp, sender, appAuthData, content) = fc in
+    if appAuthData = empty then (* Not used for now *)
+    (* Verify metadata *)
+    if mEp <> ep
+    then
+        false
+    else
+        let framedContentAuthData(signature, _) = authData in
+        let tbs = framedContentTBS(fc, ctx) in
+        VerifyWithLabel(pubKey, framedContentTBSLbl, encodeFramedContentTBS(tbs), signature).
+
+letfun verifyGroupInfo(info:GroupInfo, senderPubKey:SignaturePubKey) =
+    let groupInfo(ctx, confirmTag, tree, sender, signature) = info in
+    let tbs = groupInfoTBS(ctx, confirmTag, tree, sender) in
+    VerifyWithLabel(senderPubKey, groupInfoTBSLbl, encodeGroupInfoTBS(tbs),
+        signature).
+
+fun groupMemberInfoTBS(LeafIndex, LeafNode): bitstring [data].
+fun groupMemberInfo(LeafIndex, LeafNode, bitstring): bitstring [data].
+
+fun encodeChan(channel): bitstring.
+
+(* Tree in groupInfo must be transmitted via channel (attacker cannot write tables) *)
+(* So these processes allow to convert from one to another *)
+let TreeChannelToTable(treeChan:channel, sender:LeafIndex, newTid:TreeID) =
+    in(treeChan, groupMemberInfo(=sender, senderLf, senderSig));
+    let leafNode(_, sigPub, _, _) = senderLf in
+    if VerifyWithLabel(sigPub, encodeChan(treeChan),
+        groupMemberInfoTBS(sender, senderLf), senderSig) then
+    !(
+        in(treeChan, groupMemberInfo(idx, lf, sig));
+        if VerifyWithLabel(sigPub, encodeChan(treeChan),
+            groupMemberInfoTBS(idx, lf), sig) then
+            insert groupMembership(newTid, idx, lf)
+    ).
+
+let TreeTableToChannel(tid:TreeID, sigPriv:SignaturePrivKey, treeChan:channel) =
+    !(
+        get groupMembership(=tid, idx, lf) in
+        let sig = SignWithLabel(sigPriv, encodeChan(treeChan),
+            groupMemberInfoTBS(idx, lf)) in
+        !out(treeChan, groupMemberInfo(idx, lf, sig))
+    ).
+
+letfun protectApplicationMessage(state:MLSState, msg:bitstring) =
+    let mlsState(ctx, _, _, epochSecret, idx, sigPriv) = state in
+
+    let authMsg = signFramedContent(sigPriv, ctx, idx, empty, appDataAsContent(msg)) in
+    let protectedMsg = protectAuthenticatedContent(getSenderSecret(epochSecret),
+        secretTreeGetEncryptionInfo(getEncryptionSecret(epochSecret), idx, applicationLbl),
+        authMsg) in
+    wrapPrivateMessage(protectedMsg).
+
+type AuthenticatedMessage.
+fun authenticatedMessage(LeafIndex, bitstring): AuthenticatedMessage [data].
+
+letfun extractApplicationMessage(authContent:AuthenticatedContent) =
+    let fc = authContentGetContent(authContent) in
+    let framedContent(_, sender, _, appDataAsContent(message)) = fc in
+    authenticatedMessage(sender, message).
+
+type KeyPackageSecrets.
+fun keyPackageSecrets(KeyPackage, SignaturePrivKey, HPKEPrivKey, HPKEPrivKey):
+    KeyPackageSecrets [data].
+
+letfun generateKeyPackage() =
+    new sigPriv:SignaturePrivKey;
+    new initPriv:HPKEPrivKey;
+    new leafPriv:HPKEPrivKey;
+    let leaf = createSignedLeafNode(HPKEGetPublic(leafPriv), sigPriv, LeafNodeKP,
+        emptyLeafNodeContext()) in
+    let kp = createSignedKeyPackage(sigPriv, HPKEGetPublic(initPriv), leaf) in
+    keyPackageSecrets(kp, sigPriv, initPriv, leafPriv).
+
+
+(* -------------------------------------------------------------------------- *)
+(* Verify and apply proposals *)
+
+type AuthProposal.
+fun authProposal(Proposal, LeafIndex): AuthProposal [data].
+fun invalidProposal(): AuthProposal [data].
+
+event receiveCommitProposalReference(SignaturePubKey, MLSMessage, bitstring).
+
+(* Resolve a list of proposal *)
+letfun resolveReference(ref:bitstring, id:SignaturePubKey, pub:TreeID,
+    ctx:GroupContext, commit:MLSMessage) =
+    event receiveCommitProposalReference(id, commit, ref);
+    let ReferenceToProposal(authContent) = ref in
+    if verifyAuthMessage(pub, ctx, authContent) then
+    if authContentIsEmptyConfirmTag(authContent) then
+    let framedContent(_, _, _, proposalAsContent(proposal))
+        = authContentGetContent(authContent) in
+    authProposal(proposal, authContentGetSender(authContent)).
+
+letfun extractProposal(propOrRef:ProposalOrRef, committer:LeafIndex,
+    id:SignaturePubKey, pub:TreeID, ctx:GroupContext, commit:MLSMessage) =
+    let proposal = (
+        let wrapProposal(prop) = propOrRef
+            in authProposal(prop, committer)
+        else let wrapProposalRef(ref) = propOrRef in
+            resolveReference(ref, id, pub, ctx, commit)
+    ) in proposal.
+
+type AddProposalWithIndex.
+fun addProposalWithIndex(LeafIndex, Proposal): AddProposalWithIndex [data].
+
+letfun extractProposalWithIndex(withIdx:ProposalOrRefWithIndex, id:SignaturePubKey,
+    pub:TreeID, ctx:GroupContext, commit:MLSMessage) =
+    let proposalOrRefWithIndex(addIdx, propOrRef) = withIdx in
+    let proposal = (
+        let wrapProposal(prop) = propOrRef in prop
+        else let wrapProposalRef(ref) = propOrRef in
+            let authProposal(prop, _)
+                = resolveReference(ref, id, pub, ctx, commit) in prop
+    ) in addProposalWithIndex(addIdx, proposal).
+
+let ApplyUpdates(updsSrc:TreeID, props:SubProposals, id:SignaturePubKey,
+    pub:TreeID, ctx:GroupContext, updsDst:TreeID, commit:MLSMessage) =
+    let subProposalList(p1) = props in
+    let noProposalOrRef() = p1
+        in !(
+            get groupMembership(=updsSrc, idx, lf) in
+            insert groupMembership(updsDst, idx, lf)
+        )
+    else
+        let wrapProposalRef(ref) = p1 in
+        let authProposal(updateProposal(lf1), idx1)
+            = resolveReference(ref, id, pub, ctx, commit) in
+        if verifyLeafNodeSignature(lf1, LeafNodeUpdate, leafNodeContext(idx1)) then
+        ApplyUpdate(updsSrc, idx1, lf1, updsDst).
+
+let ApplyRemoves(remsSrc:TreeID, props:SubProposals, committer:LeafIndex,
+    id:SignaturePubKey, pub:TreeID, ctx:GroupContext, remsDst:TreeID,
+    commit:MLSMessage) =
+    let subProposalList(p1) = props in
+    let noProposalOrRef() = p1
+        in !(
+            get groupMembership(=remsSrc, idx, lf) in
+            insert groupMembership(remsDst, idx, lf)
+        )
+    else
+        let authProposal(removeProposal(removed1), _)
+            = extractProposal(p1, committer, id, pub, ctx, commit) in
+        ApplyRemove(remsSrc, removed1, remsDst).
+
+let ApplyAdds(addsDst:TreeID, props:SubProposals, id:SignaturePubKey,
+    pub:TreeID, ctx:GroupContext, commit:MLSMessage) =
+    let subIndexedProposals(p1) = props in
+    (* If there is a proposal, we can apply it *)
+    let addProposalWithIndex(addPos1, addProposal(kp1))
+        = extractProposalWithIndex(p1, id, pub, ctx, commit) in
+    if verifyKeyPackage(kp1) then
+    let keyPackage(_, leaf1, _) = kp1 in
+    ApplyAdd(addsDst, addPos1, leaf1).
+
+(* Stores welcome message recipients, associated with tree id after adds *)
+table welcomes(TreeID, HPKEPubKey).
+
+let ApplyAndSetAddProposals(addsDst:TreeID, props:SubProposals,
+    committer:LeafIndex, id:SignaturePubKey, pub:TreeID, ctx:GroupContext) =
+    let subProposalList(p1) = props in
+    (* If there is a proposal, we can apply it *)
+    let authProposal(addProposal(kp1), _)
+        = extractProposal(p1, committer, id, pub, ctx, emptyMsg) in
+    if verifyKeyPackage(kp1) then
+    let keyPackage(initKey1, lf1, _) = kp1 in
+    new pos1:LeafIndex;
+    insert welcomes(addsDst, initKey1);
+    ApplyAdd(addsDst, pos1, lf1).
+
+letfun listAddProposals(props:SubProposals, tid:TreeID, committer:LeafIndex,
+    id:SignaturePubKey, pub:TreeID, ctx:GroupContext) =
+    let subProposalList(p1) = props in
+    let noProposalOrRef() = p1 in
+        subIndexedProposals(noProposalOrRefWithIndex())
+    else
+        let authProposal(addProposal(kp1), _)
+            = extractProposal(p1, committer, id, pub, ctx, emptyMsg) in
+        if verifyKeyPackage(kp1) then
+        let keyPackage(_, lf1, _) = kp1 in
+        get groupMembership(=tid, pos1, =lf1) in
+        subIndexedProposals(proposalOrRefWithIndex(pos1, p1)).
+
+fun epochPrivateKey(SignaturePrivKey, nat): HPKEPrivKey [private].
+
+letfun applyPrivateUpdate(ep:nat, priv:HPKEPrivKey, idx:LeafIndex,
+    sigPriv:SignaturePrivKey, tid:TreeID) =
+        let newPriv = epochPrivateKey(sigPriv, ep) in
+        if getEncPublicKey(tid, idx) = HPKEGetPublic(newPriv)
+            then newPriv
+            else priv.
+
+letfun listCommitProposals(props:Proposals, tid:TreeID, committer:LeafIndex,
+    id:SignaturePubKey, pub:TreeID, ctx:GroupContext) =
+    let listProposals(updates, removes, adds) = props in
+    listProposals(updates, removes,
+        listAddProposals(adds, tid, committer, id, pub, ctx)).
+
+let BuildCommitProposals(src:TreeID, props:Proposals, committer:LeafIndex,
+    id:SignaturePubKey, ctx:GroupContext, dst:TreeID) =
+    let listProposals(updates, removes, adds) = props in
+
+    new afterUpds:TreeID;
+    (* TODO Correct when applying multiple proposals *)
+    (* new afterRems:TreeID; *)
+
+    ApplyUpdates(src, updates, id, src, ctx, afterUpds, emptyMsg) |
+    ApplyRemoves(afterUpds, removes, committer, id, src, ctx, dst, emptyMsg) |
+    ApplyAndSetAddProposals(dst, adds, committer, id, src, ctx).
+
+let ApplyProposals(src:TreeID, props:Proposals, committer:LeafIndex,
+    id:SignaturePubKey, ctx:GroupContext, dst:TreeID, commit:MLSMessage) =
+    let listProposals(updates, removes, adds) = props in
+
+    new afterUpds:TreeID;
+    (* TODO Correct when applying multiple proposals *)
+    (* new afterRems:TreeID; *)
+
+    ApplyUpdates(src, updates, id, src, ctx, afterUpds, commit) |
+    ApplyRemoves(afterUpds, removes, committer, id, src, ctx, dst, commit) |
+    ApplyAdds(dst, adds, id, src, ctx, commit).
+
+
+(* -------------------------------------------------------------------------- *)
+(* Create and process Commit *)
+
+letfun createProvisionalGroupContext(ctx:GroupContext, tid:TreeID) =
+    let groupContext(ep, _, transcriptHash) = ctx in
+    (* let treeHash = computeTreeHash(tn) in *)
+    (* TODO Tree hash *)
+    groupContext(ep + 1, empty, transcriptHash).
+
+letfun updateProvisionalGroupContext(ctx:GroupContext, transcriptHash:bitstring) =
+    let groupContext(ep, treeHash, _) = ctx in
+    groupContext(ep, treeHash, transcriptHash).
+
+const pathSecretLbl:bitstring.
+
+let EncryptCommitSecret(tid:TreeID, commitSecret:bitstring,
+    sigPriv:SignaturePrivKey, groupCtx:bitstring, pathSecrets:channel) =
+    !(
+        get groupMembership(=tid, idx, lf) in
+        let leafNode(encKey, _, _, _) = lf in
+        let encSecret =
+            EncryptWithLabel(encKey, pathSecretLbl, groupCtx, commitSecret) in
+        out(pathSecrets, pair(encSecret,
+            SignWithLabel(sigPriv, encodeChan(pathSecrets), encSecret)))
+    ).
+
+const encWelcomeLbl:bitstring.
+
+let EncryptWelcomeSecret(tid:TreeID, welcomeSecret:bitstring,
+    sigPriv:SignaturePrivKey, encGroupInfo:bitstring, welcomeSecrets:channel) =
+    !(
+        get welcomes(=tid, initPub) in
+        let encSecret = EncryptWithLabel(initPub, encWelcomeLbl, encGroupInfo,
+            welcomeSecret) in
+        out(welcomeSecrets, pair(encSecret,
+            SignWithLabel(sigPriv, encodeChan(welcomeSecrets), encSecret)))
+    ).
+
+fun newLeafSecret(SignaturePrivKey, nat): HPKEPrivKey.
+fun newCommitSecret(SignaturePrivKey, nat): bitstring.
+
+free commitGenChan:channel [private].
+not attacker(commitGenChan).
+
+type GenerateCommitReq.
+fun generateCommitReq(MLSState, Proposals): GenerateCommitReq [data].
+
+type GenerateCommitResp.
+fun generateCommitResp(MLSState, Proposals, MLSMessage, MLSMessage, MLSState):
+    GenerateCommitResp [data].
+
+let CommitCreator() =
+    in(commitGenChan, generateCommitReq(state, proposals));
+    let mlsState(ctx, pub, _, epochSecret, idx, sigPriv) = state in
+
+    let groupContext(ep, th, _) = ctx in
+    (* if verifyTreeNode(tn) && computeTreeHash(tn) = th then *)
+
+    new newTree:TreeID;
+    new newTree2:TreeID;
+    new encCommitSecrets:channel;
+    new treeChan:channel;
+    new encWelcomeSecrets:channel;
+
+    (* Build proposal list for commit and build tree as well *)
+    BuildCommitProposals(pub, proposals, idx, SignatureGetPublic(sigPriv), ctx,
+        newTree) |
+    let commitProposals = listCommitProposals(proposals, newTree, idx,
+        SignatureGetPublic(sigPriv), pub, ctx) in
+
+    (* Generate new leaf *)
+    let privKey = newLeafSecret(sigPriv, ep) in
+    let newLeaf = createSignedLeafNode(HPKEGetPublic(privKey), sigPriv,
+        LeafNodeCommit, leafNodeContext(idx)) in
+    ApplyUpdate(newTree, idx, newLeaf, newTree2) |
+
+    (* Update structures and new path *)
+    let provCtx = createProvisionalGroupContext(ctx, newTree2) in
+    let commitSecret = newCommitSecret(sigPriv, ep) in
+    EncryptCommitSecret(newTree2, commitSecret, sigPriv,
+        encodeGroupContext(provCtx), encCommitSecrets) |
+    let commit = createCommit(commitProposals, newLeaf, encCommitSecrets) in
+    let confirmTag = computeConfirmationTag(ctx, epochSecret) in
+    let authCommit = signFramedContent(sigPriv, ctx, idx, empty, commitAsContent(commit)) in
+
+    (* Generate new context and secrets *)
+    let transcriptHash = computeTranscriptHashInput(authCommit) in
+    let interimHash = Hash(pair(Hash(confirmTag), transcriptHash)) in
+    let newGroupCtx = updateProvisionalGroupContext(provCtx, interimHash) in
+    let joinerSecret = deriveJoinerSecret(getInitSecret(epochSecret),
+        commitSecret, newGroupCtx) in
+    let welcomeSecret = deriveWelcomeSecret(joinerSecret, empty) in
+    let epochSecret' = deriveEpochSecret(joinerSecret, empty, newGroupCtx) in
+    let confirmationKey = DeriveSecret(epochSecret', confirmLbl) in
+    let newConfirmTag = computeConfirmTagWithKey(newGroupCtx, confirmationKey) in
+    let authCommit' = authContentSetConfirmationTag(authCommit, confirmationTag(newConfirmTag)) in
+
+    (* Common structure for Welcome *)
+    TreeTableToChannel(newTree2, sigPriv, treeChan) |
+    let grpInfo = SignGroupInfo(sigPriv, newGroupCtx, newConfirmTag,
+        treeMembers(treeChan), idx) in
+    let encGroupInfo = EncryptWithLabel(
+        HPKEGetPublic(HPKEDeriveKey(
+            ExpandWithLabel(welcomeSecret, keyLbl, empty, AEADNk)
+        )), ExpandWithLabel(welcomeSecret, nonceLbl, empty, AEADNn),
+        empty, encodeGroupInfo(grpInfo)) in
+    EncryptWelcomeSecret(newTree, joinerSecret, sigPriv, encGroupInfo,
+        encWelcomeSecrets) |
+    let welcome = createWelcome(encWelcomeSecrets, encGroupInfo) in
+
+    (* Create new state after commit *)
+    let newState = mlsState(newGroupCtx, newTree2, privKey,
+        epochSecret', idx, sigPriv) in
+    (* Send all message and new state *)
+    let privateCommit = wrapPrivateMessage(protectAuthenticatedContent(
+        getSenderSecret(epochSecret),
+        secretTreeGetEncryptionInfo(getEncryptionSecret(epochSecret), idx, handshakeLbl),
+        authCommit')) in
+
+    out(commitGenChan, generateCommitResp(state, proposals, privateCommit,
+        wrapWelcome(welcome), newState)).
+
+free commitHandleChan:channel [private].
+not attacker(commitHandleChan).
+
+type HandleCommitReq.
+fun handleCommitReq(MLSState, MLSMessage): HandleCommitReq [data].
+
+type HandleCommitResp.
+fun handleCommitResp(MLSState, MLSMessage, MLSState): HandleCommitResp [data].
+
+let CommitHandler() =
+    in(commitHandleChan, handleCommitReq(state, message));
+    let mlsState(ctx, pub, priv, epochSecret, idx, sigPriv) = state in
+    let groupContext(ep, th, _) = ctx in
+    (* if verifyTreeNode(tn) && computeTreeHash(tn) = th then *)
+
+    let wrapPrivateMessage(protectedMessage) = message in
+    let authCommit = decodePrivateMessage(state, protectedMessage) in
+    if getMsgContentType(protectedMessage) = CT_Commit then
+
+    let authenticatedContent(fc, _) = authCommit in
+    let framedContent(_, sender, _, commitAsContent(commit)) = fc in
+    let createCommit(proposals, leaf, commitPath) = commit in
+
+    let senderPub = getPublicKey(pub, sender) in
+    if verifyAuthContentWithKey(senderPub, ctx, authCommit) then
+
+    new newTree:TreeID;
+    new newTree':TreeID;
+
+    (* Resolve, verify, and apply proposals *)
+    let id = SignatureGetPublic(sigPriv) in
+    ApplyProposals(pub, proposals, sender, id, ctx, newTree, message) |
+    let newPriv = applyPrivateUpdate(ep, priv, idx, sigPriv, newTree) in
+    if verifyLeafNodeSignature(leaf, LeafNodeCommit, leafNodeContext(sender)) then
+    ApplyUpdate(newTree, sender, leaf, newTree') |
+
+    (* Build new structures and derive commit secret *)
+    let provCtx = createProvisionalGroupContext(ctx, newTree') in
+    in(commitPath, pair(encSecret, sig));
+    if VerifyWithLabel(senderPub, encodeChan(commitPath), encSecret, sig) then
+    let commitSecret = DecryptWithLabel(newPriv, pathSecretLbl,
+        encodeGroupContext(provCtx), encSecret) in
+
+    (* Update context and key schedule to create new state *)
+    let confirmTag = computeConfirmationTag(ctx, epochSecret) in
+    let transcriptHash = computeTranscriptHashInput(authCommit) in
+    let interimHash = Hash(pair(Hash(confirmTag), transcriptHash)) in
+    let newGroupCtx = updateProvisionalGroupContext(provCtx, interimHash) in
+    let epochSecret' = deriveEpochSecret(deriveJoinerSecret(getInitSecret(epochSecret),
+        commitSecret, newGroupCtx), empty, newGroupCtx) in
+    let confirmationKey = DeriveSecret(epochSecret', confirmLbl) in
+    let newConfirmTag = computeConfirmTagWithKey(newGroupCtx, confirmationKey) in
+    if authContentGetConfirmTag(authCommit) = newConfirmTag then
+
+    out(commitHandleChan, handleCommitResp(state, message,
+        mlsState(newGroupCtx, newTree', newPriv, epochSecret', idx, sigPriv))).
+
+
+(* -------------------------------------------------------------------------- *)
+(* Create and process Proposals *)
+
+letfun protectProposal(state:MLSState, proposal:Proposal) =
+    let mlsState(ctx, _, _, epochSecret, idx, sigPriv) = state in
+
+    let authContent = signFramedContent(sigPriv, ctx, idx, empty, proposalAsContent(proposal)) in
+    let protectedContent = protectAuthenticatedContent(getSenderSecret(epochSecret),
+        secretTreeGetEncryptionInfo(getEncryptionSecret(epochSecret), idx, handshakeLbl),
+        authContent) in
+
+    wrapPrivateMessage(protectedContent).
+
+letfun createUpdateProposal(state:MLSState) =
+    let mlsState(ctx, _, _, _, idx, sigPriv) = state in
+    let ep = groupContextGetEpoch(ctx) in
+
+    let privKey = epochPrivateKey(sigPriv, ep) in
+    let newLeaf = createSignedLeafNode(HPKEGetPublic(privKey), sigPriv,
+        LeafNodeUpdate, leafNodeContext(idx)) in
+    let proposal = updateProposal(newLeaf) in
+
+    protectProposal(state, proposal).
+
+letfun createRemoveProposal(state:MLSState, removeIdx:LeafIndex) =
+    let proposal = removeProposal(removeIdx) in
+    protectProposal(state, proposal).
+
+letfun createAddProposal(state:MLSState, kp:KeyPackage) =
+    let proposal = addProposal(kp) in
+    protectProposal(state, proposal).
+
+table cachedProposals(MLSState, bitstring).
+event receivedProposal(SignaturePubKey, bitstring).
+
+letfun handleProposal(state:MLSState, proposal:AuthenticatedContent) =
+    let mlsState(_, _, _, _, _, sigPriv) = state in
+    let framedContent(_, _, authAppData, proposalAsContent(_))
+        = authContentGetContent(proposal) in
+    if authAppData = empty then (* Check because we don't use it for now *)
+    event receivedProposal(SignatureGetPublic(sigPriv), ReferenceToProposal(proposal));
+    insert cachedProposals(state, ReferenceToProposal(proposal));
+    state.
+
+
+(* -------------------------------------------------------------------------- *)
+(* Bootstrap: create initial state from either Welcome or nothing *)
+
+letfun createInitialState() =
+    (* Create leaf *)
+    new sigPriv:SignaturePrivKey;
+    new leafPriv:HPKEPrivKey;
+    let leafPub = HPKEGetPublic(leafPriv) in
+    new idx:LeafIndex;
+
+    (* Create tree *)
+    let l1 = createSignedLeafNode(leafPub, sigPriv, LeafNodeCommit,
+        leafNodeContext(idx)) in
+    new pub:TreeID;
+    insert groupMembership(pub, idx, l1);
+
+    (* Context and new key schedule *)
+    let ctx = groupContext(0, (*computeTreeHash(pub)*) empty, empty) in
+    new commitSecret:bitstring;
+    let epochSecret = deriveEpochSecret(
+        deriveJoinerSecret(empty, commitSecret, ctx), empty, ctx) in
+
+    mlsState(ctx, pub, leafPriv, epochSecret, idx, sigPriv).
+
+free welcomeHandleChan:channel [private].
+not attacker(welcomeHandleChan).
+
+type HandleWelcomeReq.
+fun handleWelcomeReq(Welcome, SignaturePrivKey, HPKEPrivKey, HPKEPrivKey): HandleWelcomeReq [data].
+
+type HandleWelcomeResp.
+fun handleWelcomeResp(Welcome, SignaturePrivKey, MLSState): HandleWelcomeResp [data].
+
+let WelcomeHandler() =
+    in(welcomeHandleChan, req:HandleWelcomeReq);
+    let handleWelcomeReq(welcome, sigPriv, initPriv, leafPriv) = req in
+
+    (* Read and decrypt message *)
+    let createWelcome(individualSecrets, encGroupInfo) = welcome in
+    in(individualSecrets, pair(encSecret, sig));
+    let joinerSecret = DecryptWithLabel(initPriv, encWelcomeLbl, encGroupInfo,
+        encSecret) in
+    let welcomeSecret = deriveWelcomeSecret(joinerSecret, empty) in
+    let encodeGroupInfo(grpInfo) = DecryptWithLabel(
+        HPKEDeriveKey(ExpandWithLabel(welcomeSecret, keyLbl, empty, AEADNk)),
+        ExpandWithLabel(welcomeSecret, nonceLbl, empty, AEADNn),
+        empty, encGroupInfo
+    ) in
+    let groupInfo(ctx, confirmTag, treeMembers(treeChan), sender, _) = grpInfo in
+    new pub:TreeID;
+    TreeChannelToTable(treeChan, sender, pub) |
+
+    (* Verify sender signed secrets in our modelisation of Welcome Secrets list *)
+    let pubKey = getPublicKey(pub, sender) in
+    if VerifyWithLabel(pubKey, encodeChan(individualSecrets), encSecret, sig) then
+    let groupContext(ep, treeHash, transcrHash) = ctx in
+    (* Verify Group Info *)
+    if verifyGroupInfo(grpInfo, pubKey) (* && verifyTreeNode(tn) *)
+        (* && treeHash = computeTreeHash(tn) *) then
+    (* Find index then derive private key tree *)
+    let idx = findLeaf(pub, HPKEGetPublic(leafPriv), SignatureGetPublic(sigPriv)) in
+    (* Update key schedule and create state *)
+    let epochSecret = deriveEpochSecret(joinerSecret, empty, ctx) in
+    if confirmTag = MAC(getConfirmationKey(epochSecret), transcrHash) then
+
+    let state = mlsState(ctx, pub, leafPriv, epochSecret, idx, sigPriv) in
+    out(welcomeHandleChan, handleWelcomeResp(welcome, sigPriv, state)).
+
+
+(* -------------------------------------------------------------------------- *)
+(* Utilities: create groups, leak state, ... *)
+
+free leakChan:channel.
+
+let LeakState(state:MLSState) =
+    out(leakChan, state) |
+    let mlsState(_, pub, _, _, _, _) = state in
+    !(
+        get groupMembership(=pub, idx, lf) in
+        out(leakChan, idx) |
+        out(leakChan, lf)
+    ).
+
+type States2.
+fun states2(MLSState, MLSState): States2 [data].
+
+letfun create2MemberGroup() =
+    (* Create leaf *)
+    new sigPriv1:SignaturePrivKey;
+    new leafPriv1:HPKEPrivKey;
+    let leafPub1 = HPKEGetPublic(leafPriv1) in
+    new idx1:LeafIndex;
+    new sigPriv2:SignaturePrivKey;
+    new leafPriv2:HPKEPrivKey;
+    let leafPub2 = HPKEGetPublic(leafPriv2) in
+    new idx2:LeafIndex;
+    (* Create tree *)
+    let l1 = createSignedLeafNode(leafPub1, sigPriv1, LeafNodeUpdate,
+        leafNodeContext(idx1)) in
+    let l2 = createSignedLeafNode(leafPub2, sigPriv2, LeafNodeCommit,
+        leafNodeContext(idx2)) in
+    new pub:TreeID;
+    insert groupMembership(pub, idx1, l1);
+    insert groupMembership(pub, idx2, l2);
+    (* Context and new key schedule *)
+    let ctx = groupContext(0, (*computeTreeHash(pub)*) empty, empty) in
+    new commitSecret:bitstring;
+    let epochSecret = deriveEpochSecret(
+        deriveJoinerSecret(empty, commitSecret,  ctx), empty, ctx) in
+
+    let state1 = mlsState(ctx, pub, leafPriv1, epochSecret, idx1, sigPriv1) in
+    let state2 = mlsState(ctx, pub, leafPriv2, epochSecret, idx2, sigPriv2) in
+
+    states2(state1, state2).
+
+type States3.
+fun states3(MLSState, MLSState, MLSState): States3 [data].
+
+letfun create3MemberGroup() =
+    (* Create leaf *)
+    new sigPriv1:SignaturePrivKey;
+    new leafPriv1:HPKEPrivKey;
+    let leafPub1 = HPKEGetPublic(leafPriv1) in
+    new idx1:LeafIndex;
+    new sigPriv2:SignaturePrivKey;
+    new leafPriv2:HPKEPrivKey;
+    let leafPub2 = HPKEGetPublic(leafPriv2) in
+    new idx2:LeafIndex;
+    new sigPriv3:SignaturePrivKey;
+    new leafPriv3:HPKEPrivKey;
+    let leafPub3 = HPKEGetPublic(leafPriv3) in
+    new idx3:LeafIndex;
+    (* Create tree *)
+    let l1 = createSignedLeafNode(leafPub1, sigPriv1, LeafNodeUpdate,
+        leafNodeContext(idx1)) in
+    let l2 = createSignedLeafNode(leafPub2, sigPriv2, LeafNodeCommit,
+        leafNodeContext(idx2)) in
+    let l3 = createSignedLeafNode(leafPub3, sigPriv3, LeafNodeCommit,
+        leafNodeContext(idx3)) in
+    new pub:TreeID;
+    insert groupMembership(pub, idx1, l1);
+    insert groupMembership(pub, idx2, l2);
+    insert groupMembership(pub, idx3, l3);
+    (* Context and new key schedule *)
+    let ctx = groupContext(0, (*computeTreeHash(pub)*) empty, empty) in
+    new commitSecret:bitstring;
+    let epochSecret = deriveEpochSecret(
+        deriveJoinerSecret(empty, commitSecret, ctx), empty, ctx) in
+
+    let state1 = mlsState(ctx, pub, leafPriv1, epochSecret, idx1, sigPriv1) in
+    let state2 = mlsState(ctx, pub, leafPriv2, epochSecret, idx2, sigPriv2) in
+    let state3 = mlsState(ctx, pub, leafPriv3, epochSecret, idx3, sigPriv3) in
+
+    states3(state1, state2, state3).

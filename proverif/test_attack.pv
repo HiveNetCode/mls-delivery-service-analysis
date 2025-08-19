@@ -1,0 +1,327 @@
+
+free ds:channel.
+
+type Group.
+fun group(GroupContext, TreeID, bitstring, channel): Group [data].
+
+event initialMember(nat, bitstring, SignaturePubKey).
+
+letfun createGroup(states:channel) =
+    new pub:TreeID;
+    new epochSecret:bitstring;
+    let ctx = groupContext(0, (*computeTreeHash(pub)*) empty, empty) in
+    group(ctx, pub, epochSecret, states).
+
+letfun addGroupMember(g:Group) =
+    let group(ctx, pub, s, states) = g in
+
+    new sigPriv:SignaturePrivKey;
+    new leafPriv:HPKEPrivKey;
+    new idx:LeafIndex;
+
+    let ep = groupContextGetEpoch(ctx) in
+    event initialMember(ep, s, SignatureGetPublic(sigPriv));
+
+    let l = createSignedLeafNode(HPKEGetPublic(leafPriv), sigPriv, LeafNodeCommit,
+        leafNodeContext(idx)) in
+    insert groupMembership(pub, idx, l);
+
+    mlsState(ctx, pub, leafPriv, s, idx, sigPriv).
+
+let AddInitialMember(g:Group) =
+    let group(ctx, pub, s, states) = g in
+    !out(states, addGroupMember(g)).
+
+event compromisedMember(nat, bitstring, SignaturePubKey).
+
+let AddCompromisedMember(g:Group) =
+    let compromised = addGroupMember(g) in
+
+    let mlsState(ctx, _, _, s, _, idPriv) = compromised in
+    let ep = groupContextGetEpoch(ctx) in
+    event compromisedMember(ep, s, SignatureGetPublic(idPriv));
+    LeakState(compromised).
+
+letfun createProposals(authProposal:AuthenticatedContent) =
+    let ref = ReferenceToProposal(authProposal) in
+    let framedContent(_, _, _, proposalAsContent(proposal))
+        = authContentGetContent(authProposal) in
+    let addProposal(_) = proposal in
+        listProposals(subProposalList(noProposalOrRef()),
+            subProposalList(noProposalOrRef()),
+            subProposalList(wrapProposalRef(ref)))
+    else let removeProposal(_) = proposal in
+        listProposals(subProposalList(noProposalOrRef()),
+            subProposalList(wrapProposalRef(ref)),
+            subProposalList(noProposalOrRef()))
+    else let updateProposal(_) = proposal in
+        listProposals(subProposalList(wrapProposalRef(ref)),
+            subProposalList(noProposalOrRef()),
+            subProposalList(noProposalOrRef())).
+
+(* Honest members would create at most one commit per epoch *)
+event createdCommit(nat, SignaturePubKey, MLSMessage).
+restriction ep:nat, id:SignaturePubKey, m:MLSMessage, m':MLSMessage;
+    event(createdCommit(ep, id, m)) && event(createdCommit(ep, id, m'))
+        ==> m = m'.
+
+(* Define happened-before relation to build order *)
+event happenedBefore(MLSMessage, MLSMessage).
+
+(* Honest client process commits only after processing previous proposals
+    (based on valid happen-before relationship) *)
+event clientProcessedProposal(SignaturePubKey, MLSMessage).
+event clientWillProcessCommit(SignaturePubKey, MLSMessage).
+restriction id:SignaturePubKey, pm:MLSMessage, cm:MLSMessage;
+    event(clientWillProcessCommit(id, cm)) && event(happenedBefore(pm, cm))
+        ==> event(clientProcessedProposal(id, pm)).
+
+(* Removes invalid traces as technically the committer does not process its
+    own commit (prevents from using the clause corresponding to the else branch
+    that is just less restrictive) *)
+restriction id:SignaturePubKey, id':SignaturePubKey, ep:nat, commit:MLSMessage;
+    event(createdCommit(ep, id, commit))
+        && event(clientWillProcessCommit(id', commit))
+        ==> id <> id'.
+
+(* Force relation for Proverif analysis
+    clientProcessedProposal(proposal message -> ref) -> receivedProposal(ref) *)
+lemma id:SignaturePubKey, authData:FramedContentAuthData, ep:nat, idx:LeafIndex,
+    appAuthData:bitstring, proposal:Proposal,
+encSenderData:bitstring, pubKey:HPKEPubKey, senderKey:HPKEPubKey, lbl:bitstring,
+    lbl2:bitstring, ctx:bitstring, ctx2:bitstring;
+    event(clientProcessedProposal(id, wrapPrivateMessage(privateMessage(
+        ep, CT_Proposal, appAuthData,
+        HPKEEncrypt(senderKey, pair(lbl2, ctx2),
+            encodeSenderData(createSenderData(idx))),
+        HPKEEncrypt(pubKey, pair(lbl, ctx),
+            encodePrivateMessageContent(privateMessageContent(
+                proposalAsContent(proposal), authData)))
+        ))))
+        ==> event(receivedProposal(id, ReferenceToProposal(
+            authenticatedContent(framedContent(ep, idx, appAuthData,
+                proposalAsContent(proposal)), authData)
+            ))).
+
+let DeliveryService() =
+    in(ds, predecessor:MLSMessage);
+    in(ds, message:MLSMessage);
+    event happenedBefore(predecessor, message).
+
+(* event acceptCommitDecision(SignaturePubKey, nat, MLSMessage, bool). *)
+event acceptCommit(nat, SignaturePubKey, MLSMessage).
+
+table commitNewState(MLSState, MLSMessage, MLSState).
+
+let CommitNoProposals(states:channel) =
+    in(states, state:MLSState);
+    let mlsState(ctx, _, _, _, _, idPriv) = state in
+
+    let emptyProposals = listProposals(
+        subProposalList(noProposalOrRef()),
+        subProposalList(noProposalOrRef()),
+        subProposalList(noProposalOrRef())
+    ) in
+
+    out(commitGenChan, generateCommitReq(state, emptyProposals)) |
+    in(commitGenChan, generateCommitResp(=state, =emptyProposals, commitMessage,
+        welcomeMessage, newState));
+
+    let ep = groupContextGetEpoch(ctx) in
+    let id = SignatureGetPublic(idPriv) in
+    event createdCommit(ep, id, commitMessage);
+
+    !out(ds, welcomeMessage) |
+    !out(ds, commitMessage) |
+
+    insert commitNewState(state, commitMessage, newState).
+
+let CommitProposal(states:channel) =
+    in(states, state:MLSState);
+    let mlsState(ctx, _, _, _, _, idPriv) = state in
+
+    let ep = groupContextGetEpoch(ctx) in
+    let id = SignatureGetPublic(idPriv) in
+
+    in(ds, proposalMsg:MLSMessage);
+
+    let wrapPrivateMessage(protectedMessage) = proposalMsg in
+    let proposal = decodePrivateMessage(state, protectedMessage) in
+    if verifyAuthenticatedContent(state, proposal) then
+    let authenticatedContent(framedContent(_, _, _, fcc), _) = proposal in
+    if getMsgContentType(protectedMessage) = CT_Proposal then
+
+    let _ = handleProposal(state, proposal) in
+    event clientProcessedProposal(id, proposalMsg);
+    let proposals = createProposals(proposal) in
+
+    out(commitGenChan, generateCommitReq(state, proposals)) |
+    in(commitGenChan, generateCommitResp(=state, =proposals, commitMessage,
+        welcomeMessage, newState));
+
+    event createdCommit(ep, id, commitMessage);
+    event happenedBefore(proposalMsg, commitMessage);
+
+    !out(ds, welcomeMessage) |
+    !out(ds, commitMessage) |
+
+    insert commitNewState(state, commitMessage, newState).
+
+(* Honest members would accept at most one commit per epoch *)
+restriction ep:nat, id:SignaturePubKey, m:MLSMessage, m':MLSMessage;
+    event(acceptCommit(ep, id, m)) && event(acceptCommit(ep, id, m'))
+        ==> m = m'.
+
+letfun checkProposalsReference(state:MLSState, authCommit:AuthenticatedContent) =
+    let authenticatedContent(fc, _) = authCommit in
+    let framedContent(_, _, _, commitAsContent(commit)) = fc in
+    let createCommit(proposals, _, _) = commit in
+
+    let listProposals(updates, removes, adds) = proposals in
+    let updatesOk = (
+        let subProposalList(prop) = updates in
+        let noProposalOrRef() = prop
+            in true
+        else let wrapProposalRef(ref) = prop in
+        get cachedProposals(=state, =ref)
+            in true
+            else false
+    ) in
+    if updatesOk then (
+        let removesOk = (
+            let subProposalList(prop) = removes in
+            let noProposalOrRef() = prop
+                in true
+            else let wrapProposal(_) = prop
+                in true
+            else let wrapProposalRef(ref) = prop in
+            get cachedProposals(=state, =ref)
+                in true
+                else false
+        ) in
+        if removesOk then (
+            let addsOk = (
+                let subIndexedProposals(prop) = adds in
+                let noProposalOrRefWithIndex() = prop
+                    in true
+                else let proposalOrRefWithIndex(_, wrapProposal(_)) = prop
+                    in true
+                else let proposalOrRefWithIndex(_, wrapProposalRef(ref)) = prop in
+                get cachedProposals(=state, =ref)
+                    in true
+                    else false
+            ) in
+            addsOk
+        ) else false
+    ) else false.
+
+let HandleCommit(states:channel, statesNext:channel) =
+    in(states, state:MLSState);
+    let mlsState(ctx, _, _, _, _, idPriv) = state in
+
+    let ep = groupContextGetEpoch(ctx) in
+    let id = SignatureGetPublic(idPriv) in
+
+    in(ds, commitMsg:MLSMessage);
+
+    get commitNewState(=state, =commitMsg, newState) in (
+        event acceptCommit(ep, id, commitMsg);
+        (* event acceptCommitDecision(id, ep, commitMsg, true); *)
+        !out(statesNext, newState)
+    )
+    else
+        let wrapPrivateMessage(protectedMessage) = commitMsg in
+        let authMsg = decodePrivateMessage(state, protectedMessage) in
+        if verifyAuthenticatedContent(state, authMsg) then
+        let authenticatedContent(framedContent(_, _, _, fcc), _) = authMsg in
+        if getMsgContentType(protectedMessage) = CT_Commit then
+
+        let commitAsContent(commitContent) = fcc in
+        event clientWillProcessCommit(id, commitMsg);
+
+        (*if checkProposalsReference(state, authMsg) then ( *)
+            out(commitHandleChan, handleCommitReq(state, commitMsg)) |
+            in(commitHandleChan, handleCommitResp(=state, =commitMsg, newState));
+
+            event acceptCommit(ep, id, commitMsg);
+            (* event acceptCommitDecision(id, ep, commitMsg, true); *)
+            !out(statesNext, newState).
+        (*).*)
+        (*else event acceptCommitDecision(id, ep, commitMsg, false).*)
+
+let SubmitUpdateProposal(states:channel) =
+    in(states, state:MLSState);
+    let updateProposalMsg = createUpdateProposal(state) in
+    !out(ds, updateProposalMsg).
+
+let SubmitRemoveProposal(states:channel) =
+    in(states, state:MLSState);
+    let mlsState(_, pub, _, _, _, _) = state in
+    get groupMembership(=pub, idx, _) in
+    let removeProposalMsg = createRemoveProposal(state, idx) in
+    !out(ds, removeProposalMsg).
+
+let HandleProposal(states:channel) =
+    in(states, state:MLSState);
+    in(ds, proposalMsg:MLSMessage);
+
+    let mlsState(_, _, _, _, _, idPriv) = state in
+    let id = SignatureGetPublic(idPriv) in
+
+    let wrapPrivateMessage(protectedProp) = proposalMsg in
+    let authProp = decodePrivateMessage(state, protectedProp) in
+    if verifyAuthenticatedContent(state, authProp) then
+    if getMsgContentType(protectedProp) = CT_Proposal then
+
+    let _ = handleProposal(state, authProp) in
+    event clientProcessedProposal(id, proposalMsg);
+    0.
+
+(*
+ * TODO
+ * - Removed from tree event ?
+ * - Add Proposal, Handle Welcome & added events ??
+ * - Test queries
+ *)
+
+free statesStart:channel [private].
+not attacker(statesStart).
+free statesSnd:channel [private].
+not attacker(statesSnd).
+
+query id:SignaturePubKey, ep:nat, commit:MLSMessage, ref:bitstring;
+    (* Check reference existence *)
+    event(receivedProposal(id, ref));
+    event(receiveCommitProposalReference(id, commit, ref));
+    event(receivedProposal(id, ref))
+        && event(receiveCommitProposalReference(id, commit, ref));
+    (* Check commit *)
+    event(acceptCommit(ep, id, commit)).
+
+query id:SignaturePubKey, commit:MLSMessage, ref:bitstring;
+    (* Property of proposal orders *)
+    event(receiveCommitProposalReference(id, commit, ref))
+        ==> event(receivedProposal(id, ref)).
+
+query id:SignaturePubKey, id':SignaturePubKey, ep:nat, commit:MLSMessage,
+    ref:bitstring;
+    (* If one accept a commit, the others have correctly received the same proposals *)
+    event(acceptCommit(ep, id, commit))
+        && event(receiveCommitProposalReference(id', commit, ref))
+            ==> event(receivedProposal(id', ref)).
+
+(* query id:SignaturePubKey, id':SignaturePubKey, ep:nat, commit:MLSMessage,
+    decision:bool, decision':bool;
+    event(acceptCommitDecision(id, ep, commit, decision))
+        && event(acceptCommitDecision(id', ep, commit, decision'))
+        ==> decision = decision'. *)
+
+process
+    let g = createGroup(statesStart) in
+
+    (!AddInitialMember(g)) | (!AddCompromisedMember(g))
+    | (!SubmitUpdateProposal(statesStart)) | (!SubmitRemoveProposal(statesStart))
+    | (!HandleProposal(statesStart))
+    | (!CommitNoProposals(statesStart)) | (!CommitProposal(statesStart))
+    | (!HandleCommit(statesStart, statesSnd))
+    | (!CommitCreator()) | (!CommitHandler()) | (!DeliveryService())

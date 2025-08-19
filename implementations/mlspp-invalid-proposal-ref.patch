@@ -1,0 +1,61 @@
+diff --git a/include/mls/state.h b/include/mls/state.h
+index ae5dc1e..ca3f6c3 100644
+--- a/include/mls/state.h
++++ b/include/mls/state.h
+@@ -121,7 +121,8 @@ public:
+   std::tuple<MLSMessage, Welcome, State> commit(
+     const bytes& leaf_secret,
+     const std::optional<CommitOpts>& opts,
+-    const MessageOpts& msg_opts);
++    const MessageOpts& msg_opts,
++    bool addInvalidProposal = false);
+ 
+   ///
+   /// Generic handshake message handlers
+@@ -336,7 +337,8 @@ protected:
+     const bytes& leaf_secret,
+     const std::optional<CommitOpts>& opts,
+     const MessageOpts& msg_opts,
+-    const CommitParams& params);
++    const CommitParams& params,
++    bool addInvalidProposal = false);
+ 
+   struct CommitMaterials;
+   CommitMaterials prepare_commit(const bytes& leaf_secret,
+diff --git a/src/state.cpp b/src/state.cpp
+index 51e345d..eb1d223 100644
+--- a/src/state.cpp
++++ b/src/state.cpp
+@@ -633,9 +633,10 @@ State::reinit(bytes group_id,
+ std::tuple<MLSMessage, Welcome, State>
+ State::commit(const bytes& leaf_secret,
+               const std::optional<CommitOpts>& opts,
+-              const MessageOpts& msg_opts)
++              const MessageOpts& msg_opts,
++              bool addInvalidProposal)
+ {
+-  return commit(leaf_secret, opts, msg_opts, NormalCommitParams{});
++  return commit(leaf_secret, opts, msg_opts, NormalCommitParams{}, addInvalidProposal);
+ }
+ 
+ struct State::CommitMaterials
+@@ -775,11 +776,18 @@ std::tuple<MLSMessage, Welcome, State>
+ State::commit(const bytes& leaf_secret,
+               const std::optional<CommitOpts>& opts,
+               const MessageOpts& msg_opts,
+-              const CommitParams& params)
++              const CommitParams& params,
++              bool addInvalidProposal)
+ {
+   // Compute the new group state
+   auto commit_materials = prepare_commit(leaf_secret, opts, params);
+ 
++  if(addInvalidProposal)
++  {
++    commit_materials.proposals.push_back(
++      { _suite.digest().hash(from_ascii("invalid proposal ref")) });
++  }
++
+   // Form the AuthenticatedContent (with signature, but not confirmation tag)
+   const auto commit = Commit{
+     commit_materials.proposals,
