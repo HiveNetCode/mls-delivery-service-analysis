@@ -35,7 +35,7 @@ else
 	CXXFLAGS += -O3
 endif
 
-all: $(BUILD)/delivery_service $(BUILD)/pki $(BUILD)/centralized_client $(BUILD)/attacker $(BUILD)/ds_aware_client
+all: $(BUILD)/delivery_service $(BUILD)/pki $(BUILD)/centralized_client $(BUILD)/attacker $(BUILD)/ds_aware_client $(BUILD)/welcome_attack_trace
 
 $(BUILD):
 	mkdir -p $(BUILD)/
@@ -61,6 +61,9 @@ $(BUILD)/attacker: attacker/centralized_client.cpp attacker/centralized_ds_inter
 	$(LD) $< $(M_CXXFLAGS) $(M_LDFLAGS) -o $@
 
 $(BUILD)/ds_aware_client: ds-aware-client/centralized_client.cpp ds-aware-client/centralized_ds_interface.hpp | $(MLSPP) $(BUILD)
+	$(LD) $< $(CXXFLAGS) $(LDFLAGS) -o $@
+
+$(BUILD)/welcome_attack_trace: welcome-attack-trace/main.cpp | $(MLSPP) $(BUILD)
 	$(LD) $< $(CXXFLAGS) $(LDFLAGS) -o $@
 
 .PHONY: clean

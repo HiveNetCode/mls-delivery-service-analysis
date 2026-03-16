@@ -309,6 +309,19 @@ public:
         }
     }
 
+    void clearCachedUpdate()
+    {
+        _cached_update.reset();
+    }
+
+    mls::Proposal getProposal(const mls::MLSMessage & message)
+    {
+        ExtendedMLSState stateCopy = *this;
+        auto valContent = stateCopy.unwrap(message);
+        auto rawContent = valContent.authenticated_content().content.content;
+        return std::get<mls::Proposal>(rawContent);
+    }
+
     bool isProposalFromSelf(const mls::MLSMessage & message)
     {
         const auto optContent = checkAndExtractContent(message, mls::ContentType::proposal);
