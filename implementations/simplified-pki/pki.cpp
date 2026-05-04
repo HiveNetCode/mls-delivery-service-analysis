@@ -102,6 +102,9 @@ int main()
     if(s == -1)
         sys_error("Error Opening socket");
 
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port = htons(PKI_PORT),

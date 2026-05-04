@@ -6,7 +6,7 @@ This folder contains all Proofs-of-concept associated to our security analysis o
 
 Dependencies:
 
-* `mlspp/`: (created at build) copy of the [MLS++](https://github.com/cisco/mlspp) open-source implementation of MLS, cloned from Github at commit `c13d725e6cce923f66496ecc3c43d5d3cd831ec2` (Date: `Sat Jun 28 05:04:46 2025 +0800`).
+* `mlspp/`: (created at build) copy of the [MLS++](https://github.com/cisco/mlspp) open-source implementation of MLS, cloned from Github at commit `92aaa4134fa45ec39957a7c81a342401fba7feb2` (Date: `Mon Apr 13 15:29:45 2026 -0400`).
 
 Utilities:
 
@@ -73,6 +73,8 @@ Additionally, the attacker client includes another command `invalid-commit` allo
 ## Scenarios
 
 Here we detail, and transcribe the two executions related the paper: the case where an attacker manages to alter the normal function of another client in the group, and the case where clients follow the 2-tier Delivery Service architecture and therefore reject the commit with an invalid proposal reference.
+
+These scenarios can be executed either manually, or using the `run_scenarios.sh` script that does it automatically.
 
 ### Attack case
 

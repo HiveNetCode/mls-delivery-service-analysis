@@ -42,7 +42,7 @@ $(BUILD):
 
 $(MLSPP):
 	git clone --recursive https://github.com/cisco/mlspp.git
-	cd $(MLSPP) && git checkout c13d725e6cce923f66496ecc3c43d5d3cd831ec2 && make cclean && make dev3 && make
+	cd $(MLSPP) && git checkout 92aaa4134fa45ec39957a7c81a342401fba7feb2 && make cclean && make dev3 && make
 
 $(BUILD)/pki: simplified-pki/pki.cpp | $(BUILD)
 	$(LD) $< -I$(COMMON) -o $@
